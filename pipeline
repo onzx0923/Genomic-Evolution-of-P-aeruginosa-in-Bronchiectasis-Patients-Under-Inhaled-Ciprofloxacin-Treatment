@@ -1,0 +1,389 @@
+
+# Steps:
+#   01  QC & Trimming         FastQC, MultiQC
+#   02  De novo Assembly      Unicycler
+#   03  Assembly QC           BUSCO
+#   04  Genome Annotation     Bakta
+#   05  Pangenome             Panaroo, snp-sites
+#   06  Phylogeny             IQ-TREE
+#   07  AMR Detection         CARD/RGI
+#   08  Variant Calling       Snippy, SnpEff          [upcoming]
+#   09  Statistical Analysis  R, AMOVA                [upcoming]
+# =============================================================================
+
+# =============================================================================
+# USER CONFIG — update these paths to match your system
+# =============================================================================
+READS_DIR=~/Desktop/Zhao_Trimmed_reads       # trimmed paired-end FASTQ files
+FASTQC_DIR=~/Desktop/fastQC                  # FastQC output
+MULTIQC_DIR=~/Desktop/multiQC               # MultiQC output
+UNICYCLER_DIR=~/Desktop/unicycler_500bp      # assembly output
+BUSCO_DIR=~/Desktop/busco_500bp            # BUSCO output
+BAKTA_DIR=~/Desktop/bakta_500bp              # Bakta annotation output
+PANAROO_INPUT=~/Desktop/panaroo_input        # collected GFF3 files
+PANAROO_OUTPUT=~/Desktop/panaroo_output      # pangenome output
+IQTREE_DIR=~/Desktop/iqtree_output           # IQ-TREE output
+RGI_DIR=~/Desktop/rgi_results                # CARD/RGI output
+
+BAKTA_DB=~/bakta_db/db                       # Bakta database path
+CARD_JSON=~/Desktop/card.json                # CARD database JSON
+MASH_DB=~/Desktop/mash_db/refseq.genomes.k21s1000.msh  # Mash reference DB
+PAO1_FNA=~/Desktop/PAO1.fna                  # PAO1 reference genome (FASTA)
+PAO1_FAA=~/Desktop/PAO1_bakta/PAO1.faa       # PAO1 annotated proteins
+
+THREADS=8
+
+
+# =============================================================================
+# STEP 01 — QC & TRIMMING
+# Assess quality of pre-trimmed reads using FastQC (per sample) and
+# MultiQC (aggregate report across all samples).
+#
+# Key metrics to check:
+#   - Per-base sequence quality (target: Q > 30 across all positions)
+#   - Adapter content (should be absent post-trimming)
+#   - Per-sequence GC content (expect ~65% for P. aeruginosa)
+#   - Duplication levels
+# NOTE: MultiQC does not support osx-arm64 via bioconda — installed via pip.
+# =============================================================================
+echo "=== STEP 01: QC & Trimming ==="
+
+conda activate project
+
+mkdir -p "$FASTQC_DIR" "$MULTIQC_DIR"
+
+# Run FastQC on all trimmed reads in parallel
+fastqc \
+  --outdir "$FASTQC_DIR" \
+  --threads "$THREADS" \
+  "$READS_DIR"/*
+
+# Aggregate all FastQC reports into one MultiQC HTML report
+multiqc "$FASTQC_DIR" \
+  -o "$MULTIQC_DIR"
+
+echo "FastQC reports: $FASTQC_DIR"
+echo "MultiQC report: $MULTIQC_DIR/multiqc_report.html"
+
+
+# =============================================================================
+# STEP 02 — DE NOVO ASSEMBLY
+# Assemble paired-end reads into contigs using Unicycler.
+#
+# Mode: normal (selected over conservative after benchmarking — see below)
+#   Conservative: 64 contigs, N50 = 206 kb
+#   Normal:       45 contigs, N50 = 414 kb  <-- selected
+#
+# min_fasta_length: 500bp
+#   Retains smaller contigs that may carry AMR genes or accessory elements.
+#   Default 1000bp was too aggressive — small resistance-associated contigs
+#   were being discarded.
+#
+# Expected output per sample: assembly.fasta (~6.2–6.3 Mb, consistent with
+# PAO1 reference genome at 6.26 Mb)
+#
+# NOTE: Unicycler requires its own conda environment (python=3.10).
+#       Apple Silicon: no special config needed for unicycler.
+# =============================================================================
+echo "=== STEP 02: De Novo Assembly ==="
+
+conda activate unicycler
+
+mkdir -p "$UNICYCLER_DIR"
+cd "$READS_DIR"
+
+for r1 in *_R1.fastq.gz; do
+  sample=${r1%_R1.fastq.gz}       # strip _R1.fastq.gz to get sample name
+  echo "  Assembling: $sample"
+
+  unicycler \
+    -1 "${sample}_R1.fastq.gz" \  # forward reads
+    -2 "${sample}_R2.fastq.gz" \  # reverse reads
+    -o "${UNICYCLER_DIR}/unicycler_${sample}" \
+    --mode normal \               # conservative | normal | bold
+    --min_fasta_length 500 \
+    --threads "$THREADS"
+done
+
+echo "Assemblies complete: $UNICYCLER_DIR"
+
+
+# =============================================================================
+# STEP 03 — ASSEMBLY QC (BUSCO)
+# Assess assembly completeness using BUSCO against the bacteria_odb10
+# reference lineage database.
+#
+# BUSCO checks for the presence of conserved single-copy orthologs expected
+# in all bacterial genomes. Target: >95% complete BUSCOs.
+#
+# Output categories:
+#   C  = Complete (single copy + duplicated)
+#   F  = Fragmented
+#   M  = Missing
+#
+# NOTE: BUSCO does not support Apple Silicon (osx-arm64). The busco_env
+#       must be created under Intel emulation:
+#         conda config --set subdir osx-64
+#         conda create -n busco_env -c conda-forge -c bioconda busco
+#         conda config --remove-key subdir
+# =============================================================================
+echo "=== STEP 03: Assembly QC (BUSCO) ==="
+
+conda activate busco_env
+
+mkdir -p "$BUSCO_DIR"
+cd "$UNICYCLER_DIR"
+
+for dir in unicycler_*; do
+  sample=${dir#unicycler_}        # strip unicycler_ prefix
+  echo "  BUSCO QC: $sample"
+
+  busco \
+    -i "${dir}/assembly.fasta" \  # assembled genome
+    -l bacteria_odb10 \           # bacterial lineage database
+    -m genome \                   # genome mode (not protein/transcriptome)
+    -o "${BUSCO_DIR}/busco_${sample}" \
+    --cpu "$THREADS"
+done
+
+echo "BUSCO reports: $BUSCO_DIR"
+
+
+# =============================================================================
+# STEP 04 — GENOME ANNOTATION (BAKTA)
+# Annotate assembled genomes using Bakta to produce standardised GFF3,
+# FASTA protein (.faa), and GenBank files for downstream analysis.
+#
+# Bakta is used rather than Prokka for:
+#   - More accurate gene function annotation via NCBI databases
+#   - Clean GFF3 output compatible with Panaroo
+#   - Consistent CDS calling across all 280 genomes
+#
+# The PAO1 reference genome is also annotated with Bakta to ensure
+# consistent annotation style when included in the pangenome.
+#
+# NOTE: Bakta does not support Apple Silicon (osx-arm64):
+#         conda config --set subdir osx-64
+#         conda create -n bakta_env -c conda-forge -c bioconda bakta
+#         conda config --remove-key subdir
+#       Download database once:
+#         bakta_db download --output ~/bakta_db
+# =============================================================================
+echo "=== STEP 04: Genome Annotation (Bakta) ==="
+
+conda activate bakta_env
+
+mkdir -p "$BAKTA_DIR"
+cd "$UNICYCLER_DIR"
+
+for dir in unicycler_*; do
+  sample=${dir#unicycler_}
+  echo "  Annotating: $sample"
+
+  bakta \
+    --db "$BAKTA_DB" \
+    --genus Pseudomonas \
+    --species aeruginosa \
+    --output "${BAKTA_DIR}/bakta_${sample}" \
+    --threads "$THREADS" \
+    "${dir}/assembly.fasta"
+done
+
+# Annotate PAO1 reference genome for inclusion in pangenome
+echo "  Annotating PAO1 reference..."
+bakta \
+  --db "$BAKTA_DB" \
+  --output ~/Desktop/PAO1_bakta \
+  --prefix PAO1 \
+  --threads "$THREADS" \
+  "$PAO1_FNA"
+
+echo "Annotation complete: $BAKTA_DIR"
+
+
+# =============================================================================
+# STEP 05 — PANGENOME CONSTRUCTION (PANAROO)
+# Build a pangenome from all annotated isolates + PAO1 reference to identify
+# the core genome (genes present in all isolates) and accessory genome.
+#
+# Core genome alignment is used for:
+#   - SNP-based phylogenetic inference (Step 06)
+#   - Identifying conserved vs variable genomic regions
+#
+# Flags:
+#   --clean-mode strict       removes likely contamination/spurious genes
+#   --remove-invalid-genes    handles premature stop codons in GFF
+#   -a core                   generates core_gene_alignment_filtered.aln
+#
+# panaroo-qc is run first to detect mislabelled/contaminated samples using
+# Mash distances against the RefSeq database.
+#
+# NOTE: PAO1.gff3 is copied into panaroo_input/ so it is included as a
+#       reference strain in the pangenome graph.
+# =============================================================================
+echo "=== STEP 05: Pangenome (Panaroo) ==="
+
+conda activate panaroo
+
+# Collect all GFF3 files into one input directory
+mkdir -p "$PANAROO_INPUT"
+cd "$BAKTA_DIR"
+
+for dir in bakta_*; do
+  sample=${dir#bakta_}
+  cp "${dir}/assembly.gff3" "${PANAROO_INPUT}/${sample}.gff3"
+done
+
+# Add PAO1 reference
+cp ~/Desktop/PAO1_bakta/PAO1.gff3 "${PANAROO_INPUT}/PAO1.gff3"
+
+echo "  GFF3 files collected: $(ls $PANAROO_INPUT/*.gff3 | wc -l)"
+
+# QC: check for contamination and mislabelled samples
+panaroo-qc \
+  -t "$THREADS" \
+  --graph_type all \
+  -i "${PANAROO_INPUT}"/*.gff3 \
+  --ref_db "$MASH_DB" \
+  -o ~/Desktop/panaroo_qc_results
+
+# Build pangenome
+panaroo \
+  -i "${PANAROO_INPUT}"/*.gff3 \
+  -o "$PANAROO_OUTPUT" \
+  -t "$THREADS" \
+  --clean-mode strict \
+  --remove-invalid-genes \
+  -a core
+
+echo "Core alignment: ${PANAROO_OUTPUT}/core_gene_alignment_filtered.aln"
+echo "Gene presence/absence: ${PANAROO_OUTPUT}/gene_presence_absence.csv"
+
+# Extract variable (SNP) positions from core alignment
+conda activate snpsites
+
+mkdir -p "$IQTREE_DIR"
+
+snp-sites \
+  -o "${IQTREE_DIR}/core_snps_filtered.aln" \
+  "${PANAROO_OUTPUT}/core_gene_alignment_filtered.aln"
+
+echo "Core SNPs extracted: ${IQTREE_DIR}/core_snps_filtered.aln"
+
+
+# =============================================================================
+# STEP 06 — PHYLOGENETIC INFERENCE (IQ-TREE)
+# Construct a maximum-likelihood phylogenetic tree from the core SNP
+# alignment to confirm clonal lineage structure and within-patient
+# relatedness across timepoints.
+#
+# Model: GTR+ASC
+#   GTR = General Time Reversible — appropriate for bacterial genome SNPs
+#   ASC = Ascertainment Bias Correction — required when input is SNP-only
+#         alignment (not full genome), to correct for the absence of
+#         invariant sites inflating branch lengths
+#
+# Bootstrap: 1000 ultrafast replicates for branch support values
+#
+# Expected result: all 280 isolates confirmed as Phylogenetic Group 1;
+# within-patient isolates cluster together, validating longitudinal
+# comparisons.
+# =============================================================================
+echo "=== STEP 06: Phylogeny (IQ-TREE) ==="
+
+conda activate iqtree
+
+iqtree \
+  -s "${IQTREE_DIR}/core_snps_filtered.aln" \
+  -m GTR+ASC \           # substitution model + ascertainment bias correction
+  -B 1000 \              # ultrafast bootstrap replicates
+  -T "$THREADS" \
+  --prefix "${IQTREE_DIR}/pa_core_phylogeny"
+
+echo "Tree file: ${IQTREE_DIR}/pa_core_phylogeny.treefile"
+
+
+# =============================================================================
+# STEP 07 — AMR DETECTION (CARD / RGI)
+# Identify known antimicrobial resistance genes and mutations using the
+# Comprehensive Antibiotic Resistance Database (CARD) and Resistance Gene
+# Identifier (RGI).
+#
+# Input: protein sequences (.faa) from Bakta annotation
+# Method: protein homology to CARD database entries
+#
+# Key resistance mechanisms expected in P. aeruginosa:
+#   - gyrA / parC mutations   — fluoroquinolone target modification
+#   - mexAB-oprM overexpression — efflux pump (ciprofloxacin efflux)
+#
+# PAO1 is run as a reference to establish the baseline resistance gene
+# complement, allowing comparison against clinical isolates.
+#
+# Setup (run once):
+#   conda create -n rgi_env python=3.8
+#   conda install -c conda-forge -c bioconda rgi
+#   wget https://card.mcmaster.ca/latest/data -O card_data.tar.gz
+#   tar -xvf card_data.tar.gz ./card.json
+#   rgi load --card_json card.json --local
+# =============================================================================
+echo "=== STEP 07: AMR Detection (CARD/RGI) ==="
+
+conda activate rgi_env
+
+mkdir -p "$RGI_DIR"
+rgi load -i "$CARD_JSON" --local
+
+cd "$BAKTA_DIR"
+
+for dir in bakta_*; do
+  sample=${dir#bakta_}
+  echo "  RGI: $sample"
+
+  rgi main \
+    -i "${dir}/assembly.faa" \    # protein input from Bakta
+    -o "${RGI_DIR}/rgi_${sample}" \
+    -t protein \
+    --local \
+    --clean \
+    -n "$THREADS"
+done
+
+# Run RGI on PAO1 reference
+rgi main \
+  -i "$PAO1_FAA" \
+  -o "${RGI_DIR}/rgi_PAO1" \
+  -t protein \
+  --local \
+  --clean \
+  -n "$THREADS"
+
+echo "RGI results: $RGI_DIR"
+
+
+# =============================================================================
+# STEP 08 — VARIANT CALLING [UPCOMING]
+
+# =============================================================================
+# STEP 09 — STATISTICAL ANALYSIS [UPCOMING]
+# Longitudinal allele frequency analysis and population genomics statistics
+# to test the core research hypothesis.
+#
+# Analyses planned:
+#
+# 1. Allele frequency dynamics
+#    - Extract allele frequencies (AF) for target loci from Snippy VCF files
+#    - Plot AF trajectories across 9 timepoints per patient
+#    - Shade ON (green) vs OFF (white) phases for visual interpretation
+#    - Test whether AF rises during ON and falls during OFF phases
+#
+# 2. AMOVA (Analysis of Molecular Variance) — R package: vegan
+#    - Tests whether genomic diversity is structured by:
+#        cycle phase (ON vs OFF)  >  patient identity  >  treatment group
+#    - Significant cycle phase effect = evidence of oscillating selection
+#
+# 3. Treatment vs placebo comparison
+#    - Fisher's exact test: which mutations are enriched in treatment vs placebo
+#    - Nucleotide diversity (pi) per group per timepoint
+#    - Distinguishes treatment-driven positive selection from neutral drift
+
+
